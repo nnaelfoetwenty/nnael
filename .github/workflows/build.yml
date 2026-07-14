@@ -33,24 +33,75 @@ on:
       bot_token:
         description: 'Telegram Bot Token'
         required: true
+      # NEW: ZIP Build Inputs
+      build_id:
+        description: 'Build ID (for ZIP builds)'
+        required: false
+        default: ''
+      zip_path:
+        description: 'ZIP Path in Repository (for ZIP builds)'
+        required: false
+        default: ''
+      is_zip:
+        description: 'Is ZIP Build'
+        required: false
+        default: 'false'
+      project_type:
+        description: 'Project Type (flutter/android)'
+        required: false
+        default: 'android'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       actions: write
 
     steps:
       - name: Notify Start
         run: |
+          BUILD_INFO=""
+          if [ "${{ inputs.is_zip }}" = "true" ]; then
+            BUILD_INFO="📦 Tipe: ZIP Build%0A🆔 Build ID: ${{ inputs.build_id }}%0A"
+          fi
           curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
             -d chat_id="${{ inputs.chat_id }}" \
             -d parse_mode="HTML" \
-            -d text="⏳ <b>Build dimulai!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A🔢 Versi: <code>${{ inputs.version_name }}</code>+<code>${{ inputs.version_code }}</code>%0A🔨 Tipe: <code>${{ inputs.build_type }}</code>"
+            -d text="⏳ <b>Build dimulai!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A🔢 Versi: <code>${{ inputs.version_name }}</code>+<code>${{ inputs.version_code }}</code>%0A🔨 Tipe: <code>${{ inputs.build_type }}</code>%0A${BUILD_INFO}"
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      # NEW: Download ZIP for ZIP builds
+      - name: Download ZIP Project
+        if: github.event.inputs.is_zip == 'true'
+        run: |
+          echo "📥 Downloading ZIP from repository..."
+          mkdir -p temp_zip
+          cd temp_zip
+          curl -L -o project.zip "https://raw.githubusercontent.com/${{ github.repository }}/main/${{ github.event.inputs.zip_path }}"
+          unzip -q project.zip -d project
+          echo "📂 ZIP extracted successfully"
+          ls -la project/
+
+      # NEW: Use downloaded ZIP as project source
+      - name: Setup Project from ZIP
+        if: github.event.inputs.is_zip == 'true'
+        run: |
+          # Copy extracted project to workspace
+          if [ -d "temp_zip/project" ]; then
+            # Check if there's a single root folder
+            CONTENTS=($(ls -A temp_zip/project))
+            if [ ${#CONTENTS[@]} -eq 1 ] && [ -d "temp_zip/project/${CONTENTS[0]}" ]; then
+              # If single folder, move contents up
+              mv temp_zip/project/${CONTENTS[0]}/* temp_zip/project/
+              rmdir temp_zip/project/${CONTENTS[0]}
+            fi
+            # Copy to workspace
+            cp -r temp_zip/project/* .
+            echo "✅ Project files copied to workspace"
+          fi
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -66,8 +117,14 @@ jobs:
       - name: Install Pillow
         run: pip install Pillow
 
+      - name: Setup Flutter (if Flutter project)
+        if: github.event.inputs.project_type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
       - name: Generate App Icons
-        run: python3 generate_icons.py
+        run: python3 generate_icons.py || echo "Icon generation skipped"
 
       - name: Patch AndroidManifest.xml
         run: |
@@ -99,17 +156,80 @@ jobs:
 
       - name: Setup Gradle Wrapper
         run: |
-          curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
-            "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar"
-          chmod +x android/gradlew
+          if [ -f "android/gradlew" ]; then
+            chmod +x android/gradlew
+          else
+            # Create gradle wrapper if not exists
+            mkdir -p android/gradle/wrapper
+            curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
+              "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar"
+            chmod +x android/gradlew 2>/dev/null || echo "Gradlew not found, skipping"
+          fi
 
-      - name: Build APK
+      # Flutter Build
+      - name: Build Flutter APK
+        if: github.event.inputs.project_type == 'flutter'
+        run: |
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            flutter build apk --release
+          else
+            flutter build apk --debug
+          fi
+          mkdir -p output
+          BUILD_TYPE="${{ inputs.build_type }}"
+          cp build/app/outputs/apk/${BUILD_TYPE}/app-${BUILD_TYPE}.apk output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
+
+      # Android Native Build
+      - name: Build Android Native APK
+        if: github.event.inputs.project_type == 'android'
         run: |
           cd android
           if [ "${{ inputs.build_type }}" = "release" ]; then
             ./gradlew assembleRelease --no-daemon
           else
             ./gradlew assembleDebug --no-daemon
+          fi
+          cd ..
+          mkdir -p output
+          APK_SRC="android/app/build/outputs/apk"
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            APK_SRC="$APK_SRC/release"
+          else
+            APK_SRC="$APK_SRC/debug"
+          fi
+          find "$APK_SRC" -name "*.apk" | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
+
+      # Fallback build (try both)
+      - name: Build APK (Fallback)
+        if: github.event.inputs.project_type == 'unknown' || github.event.inputs.project_type == ''
+        run: |
+          # Try Android build first
+          if [ -f "android/gradlew" ] || [ -f "gradlew" ]; then
+            if [ -f "gradlew" ]; then
+              chmod +x gradlew
+              if [ "${{ inputs.build_type }}" = "release" ]; then
+                ./gradlew assembleRelease --no-daemon
+              else
+                ./gradlew assembleDebug --no-daemon
+              fi
+            else
+              cd android
+              chmod +x gradlew
+              if [ "${{ inputs.build_type }}" = "release" ]; then
+                ./gradlew assembleRelease --no-daemon
+              else
+                ./gradlew assembleDebug --no-daemon
+              fi
+              cd ..
+            fi
+            mkdir -p output
+            APK_SRC="app/build/outputs/apk"
+            if [ "${{ inputs.build_type }}" = "release" ]; then
+              APK_SRC="$APK_SRC/release"
+            else
+              APK_SRC="$APK_SRC/debug"
+            fi
+            find "$APK_SRC" -name "*.apk" 2>/dev/null | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
           fi
 
       - name: Rename APK
@@ -120,7 +240,9 @@ jobs:
           else
             APK_SRC="android/app/build/outputs/apk/debug"
           fi
-          find "$APK_SRC" -name "*.apk" | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
+          if [ -d "android" ]; then
+            find "$APK_SRC" -name "*.apk" 2>/dev/null | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
+          fi
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
@@ -131,13 +253,29 @@ jobs:
 
       - name: Send APK to Telegram
         run: |
-          APK=$(find output -name "*.apk" | head -1)
-          SIZE=$(du -sh "$APK" | cut -f1)
-          curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
-            -F chat_id="${{ inputs.chat_id }}" \
-            -F document=@"$APK" \
-            -F parse_mode="HTML" \
-            -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${{ inputs.app_name }}%0A📦 <b>Package:</b> <code>${{ inputs.package_name }}</code>%0A🔢 <b>Versi:</b> <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 <b>Tipe:</b> <code>${{ inputs.build_type }}</code>%0A📁 <b>Size:</b> <code>$SIZE</code>%0A%0A⚡ by @Zyvarno1"
+          APK=$(find output -name "*.apk" 2>/dev/null | head -1)
+          if [ -n "$APK" ] && [ -f "$APK" ]; then
+            SIZE=$(du -sh "$APK" | cut -f1)
+            curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendDocument" \
+              -F chat_id="${{ inputs.chat_id }}" \
+              -F document=@"$APK" \
+              -F parse_mode="HTML" \
+              -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${{ inputs.app_name }}%0A📦 <b>Package:</b> <code>${{ inputs.package_name }}</code>%0A🔢 <b>Versi:</b> <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 <b>Tipe:</b> <code>${{ inputs.build_type }}</code>%0A📁 <b>Size:</b> <code>$SIZE</code>%0A🆔 <b>Build ID:</b> <code>${{ inputs.build_id }}</code>%0A%0A⚡ by @Zyvarno1"
+          else
+            curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
+              -d chat_id="${{ inputs.chat_id }}" \
+              -d parse_mode="HTML" \
+              -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A%0AAPK tidak ditemukan. Cek log di GitHub Actions."
+          fi
+
+      # NEW: Delete ZIP from repository after build
+      - name: Delete ZIP from Repository
+        if: github.event.inputs.is_zip == 'true' && github.event.inputs.zip_path != ''
+        run: |
+          curl -X DELETE \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/${{ github.event.inputs.zip_path }}?message=Delete%20temporary%20zip%20file"
 
       - name: Notify Failure
         if: failure()
